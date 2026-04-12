@@ -1,33 +1,40 @@
 # Ticketing Data Cleaning & Marketing Report Scripts
 
 ## 📝 Project Description
-This repository contains a set of R scripts I developed during my internship to automate the tedious process of ticketing data reconciliation and marketing performance tracking. 
+This repository contains a set of R scripts and Quarto reports I developed during my internship to automate ticketing data reconciliation and marketing performance tracking for major musical theater productions (e.g., *Matilda the Musical*, *Next to Normal*).
 
-In the musical theater industry, sales data comes from many different sources (like Damai, Maoyan, and various local distributors), each with its own messy format. My goal was to replace manual Excel copy-pasting with a more reliable **automated data pipeline**.
+In the musical theater industry, sales data is highly fragmented across 30+ sources, including direct sales systems, ticketing platforms (Damai, Maoyan), and various venue-side reports. These tools replace manual Excel work with an **automated data pipeline**.
 
-## 🛠 What These Scripts Do
+## 🛠 Key Features & Workflows
 
-### 1. Cleaning Messy Data (ETL)
-* **Format Standardization**: I wrote scripts to read 30+ different types of Excel reports from various ticketing platforms and turn them into one clean, consistent table.
-* **Fixing "Broken" Data**: I designed functions to patch missing referral codes caused by system glitches and to fix inconsistent date formats (like "11.18" vs "2023-11-18").
-* **Smart Parsing**: Since many distributors list sales as text (e.g., "Package of 3 tickets"), the script uses regular expressions to automatically extract the actual price and quantity.
+### 1. Multi-Source ETL (Extract, Transform, Load)
+* **Heterogeneous Data Ingestion**: Automated parsing of reports from venue partners (e.g., Shenzhen Poly Theatre, Shanghai Conservatory Opera House) and ticketing giants like Maoyan.
+* **Smart Business Logic**: Built-in functions to decode complex ticketing tiers (e.g., "Buy 2 Get 1 Free" packages) and standardize inconsistent date/time strings into ISO formats.
+* **Resilient Data Patching**: Designed mechanisms to backfill missing referral codes during system outages to ensure complete marketing attribution.
 
-### 2. Marketing Attribution
-* **Tracking Sales Sources**: The scripts match sales records with specific marketing activities (like a WeChat article or a Weibo post) based on referral codes to see which promotion actually worked.
-* **Social Media Summary**: I combined data from various platforms (WeChat, Weibo, Bilibili, Douyin, XHS) into one weekly report to track follower growth and engagement in one place.
+### 2. Marketing ROI & Attribution
+* **Conversion Analytics**: For self-operated channels, the scripts calculate specific conversion rates (Order/Ticket conversion) for marketing actions like WeChat push articles or Weibo posts.
+* **Cross-Platform Consolidation**: Merges weekly performance metrics (followers, views, engagement) from WeChat, Weibo, Douyin, Bilibili, and Xiaohongshu into one unified dashboard.
 
-### 3. Inventory Monitoring
-* **Sales vs. Capacity**: The scripts help track how many tickets have been sold against the theater's actual seat capacity for each session and price tier.
+### 3. Real-Time Inventory Monitoring
+* **Cross-System Sync**: A specialized pipeline that reconciles "Direct Sales" inventory with "Venue-held" and "Third-party" inventory.
+* **Inventory Visualization**: Automatically generates session-level and price-tier-level reports to show exactly which seats are locked, sold, or available for relocation across different systems.
 
-## 💡 Technical Highlights (What I Learned)
-* **Handling Real-World Data**: Learned that real data is never "clean." I used a lot of `regex` and `stringr` to handle unexpected text formats.
-* **Functional Thinking**: Instead of writing the same code over and over, I started using **factory functions** to handle similar sales channels more efficiently.
-* **Pipeline Automation**: Used R's `tidyverse` to build a workflow that takes raw files as input and outputs a final report, reducing the time spent on manual work from hours to minutes.
+## 💡 Technical Highlights (Internship Learnings)
+* **Regex & String Manipulation**: Used extensive Regular Expressions to handle "messy" real-world data where the same show might be named differently across platforms.
+* **Functional Programming**: Implemented factory functions to handle dozens of similar distributor channels efficiently without code bloat.
+* **Business-Driven Tech**: Learned how to translate complex theater promotion policies (Early bird tiers, bulk order discounts) into clean, maintainable code.
 
 ## 📂 File Structure
-* `daily_report_functions.R`: The core "toolbox" containing all mapping rules and cleaning functions.
-* `ma_etl.R`: The main script to process raw ticketing files into a master dataset.
-* `market_analysis.qmd`: A Quarto document that generates the final marketing performance report.
+* `daily_report_functions.R`: Core utility library for mapping rules, production identifiers, and revenue multipliers.
+* `ma_etl.R`: ETL pipeline for *Matilda the Musical*, focused on standardized wide-table generation.
+* `ntn_daily_report.qmd`: A specialized reporting tool for *Next to Normal* tour, integrating real-time venue-side inventory and marketing conversion analysis.
+* `market_analysis.qmd`: Comprehensive weekly report for cross-platform marketing performance.
 
+## 🔒 Data Privacy & Security
+**Important Note:** To comply with data privacy standards and protect corporate confidentiality:
+* **Anonymization**: All personally identifiable information (PII) such as customer names, phone numbers, and addresses has been removed or replaced with synthetic data.
+* **Redaction**: Sensitive business information, including specific contract values and private client lists, has been de-identified or generalized.
+* **Code Only**: This repository is intended to demonstrate data engineering logic and script architecture. No raw, sensitive datasets from the original organization are included in this repository.
 ---
-*Note: This project was completed during my internship to support data-driven decision making for theater productions.*
+*Note: These tools were built during my internship to support data-driven ticketing and marketing decisions.*
