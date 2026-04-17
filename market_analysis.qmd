@@ -1,0 +1,747 @@
+---
+title: "Market-Side Data Analysis"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-location: body
+    toc-depth: 3
+    number-sections: true
+execute:
+  echo: false
+---
+
+```{r setup}
+#| echo: false
+#| output: false
+library(tidyverse)
+library(dplyr)
+library(MASS)
+library(ggrepel)
+library(forecast)
+library(openxlsx)
+library(ggridges)
+library(tidyr)
+library(cowplot)
+library(ggcorrplot)
+library(ggforce)
+library(RColorBrewer)
+library(rJava)
+library(xlsxjars)
+library(xlsx)
+library(readxl)
+library(patchwork)
+library(colourpicker)
+library(lubridate)
+options(scipen = 10)
+```
+
+```{r config}
+# Set reporting window: [date_last_mon, date_this_mon)
+date_last_mon <- as.POSIXct("2023-12-18", tz = "UTC")
+date_this_mon <- date_last_mon + 7 * 24 * 3600
+
+source("daily_report_functions.R")
+```
+
+## Sales Data
+
+```{r direct-sales}
+# --- Direct (self-operated) ticketing channel ---
+da |>
+  filter(
+    项目 != "测试",
+    地址信息 != "测试",
+    下单时间 >= as.POSIXct("2023-08-12 00:00:00", tz = "UTC")
+  ) |>
+  mutate(剧目 = mark_musicals(项目)) |>
+  filter(剧目 != "test") |>
+  mutate(
+    场次      = as.character(开始时间),
+    渠道类型  = "自营",
+    渠道明细  = mark_from(分销码, 下单时间)[, 1],
+    动作日期  = mark_from(分销码, 下单时间)[, 2],
+    动作类型  = mark_from(分销码, 下单时间)[, 3],
+    实收      = 结算金额,
+    张数      = 1,
+    地址      = 地址信息,
+    收货人手机 = as.character(收货人手机)
+  ) |>
+  mutate(
+    渠道类型 = mark_qudao_zy(动作类型),
+    实收     = 实收 * as.numeric(mark_piaoti_zy(渠道类型, 渠道明细, "MA", 票价))
+  ) |>
+  dplyr::select(
+    剧目, 场次, 下单时间, 渠道类型, 渠道明细,
+    动作日期, 动作类型, 票价, 实收, 张数,
+    收货人姓名, 收货人手机, 地址
+  ) -> da_edit
+```
+
+```{r distributor-sales}
+# --- Distributor (system) ticketing channel ---
+da_fenxiao |>
+  filter(!is.element(项目, c("测试站票项目", "音乐剧《玛蒂尔达》周边", "《摇滚莫扎特》周边"))) |>
+  filter(场地 != "test") |>
+  mutate(剧目 = mark_musicals(项目)) |>
+  # Patch missing referral codes caused by a known system outage period
+  mutate(分销码 = if_else(
+    is.element(项目, "法国音乐剧《摇滚莫扎特》中文版【北京预演场】-诺基亚"),
+    "KHvDKHvNJY", 分销码
+  )) |>
+  mutate(分销码 = if_else(
+    is.element(项目, "法国音乐剧《摇滚莫扎特》中文版【北京预演场】0912-0918") &
+      is.element(分销码, c("-", "QMvGZHvAZ")),
+    "KHvDKHvNJY", 分销码
+  )) |>
+  mutate(
+    场次      = as.character(开始时间),
+    渠道类型  = "分销-系统",
+    渠道明细  = mark_from_name(分销码),
+    地址      = 地址信息,
+    收货人手机 = as.character(收货人手机),
+    票价      = mark_fenxiao_price(票种)[, 1],
+    张数      = mark_fenxiao_price(票种)[, 2]
+  ) |>
+  mutate(
+    渠道类型 = mark_piaoti_fx(渠道明细, "MA", 票价)[, 1],
+    实收     = 结算金额 * as.numeric(mark_piaoti_fx(渠道明细, "MA", 票价)[, 2])
+  ) |>
+  dplyr::select(
+    剧目, 场次, 下单时间, 渠道类型, 渠道明细,
+    票价, 实收, 张数, 收货人姓名, 收货人手机, 地址
+  ) -> da_fenxiao_edit
+```
+
+```{r merge-sales}
+# Combine both channels and annotate project/venue from session datetime
+da_for_market <-
+  da_edit |>
+  bind_rows(da_fenxiao_edit) |>
+  mutate(
+    动作日期 = coalesce(动作日期, ""),
+    项目     = mark_project(场次, 剧目)[, 1],
+    剧场     = mark_project(场次, 剧目)[, 2]
+  )
+```
+
+## WeChat Subscription Account (订阅号)
+
+### Follower Count
+
+```{r wx-sub-fans}
+path         <- list.files("E:/实习工作/数据/市场端数据分析/七幕-订阅号", full.names = TRUE)
+path_user    <- path[str_detect(path, "user")]
+path_article <- path[!str_detect(path, "user")]
+```
+
+```{r wx-sub-fans-load}
+# Files must be opened and re-saved before reading (Excel format quirk)
+da_wx_fan_num <- map_dfr(path_user, function(f) {
+  tmp <- readxl::read_xls(f)
+  tmp[-c(1, 2), ] |> `colnames<-`(tmp[1, ])
+}) |>
+  mutate(日期 = as.POSIXct("2023-01-01", tz = "UTC") + (as.numeric(时间) - 44927) * 3600 * 24) |>
+  dplyr::select(-时间) |>
+  relocate(日期)
+```
+
+### Article Performance
+
+```{r wx-sub-articles}
+da_wx_article <- map_dfr(path_article, readxl::read_xls) |>
+  mutate(发表时间 = as.POSIXct(发表时间, format = "%Y%m%d", tz = "UTC")) |>
+  arrange(发表时间)
+```
+
+## WeChat Service Account (服务号)
+
+### Follower Count
+
+```{r wx-svc-fans}
+path         <- list.files("E:/实习工作/数据/市场端数据分析/七幕-服务号", full.names = TRUE)
+path_user    <- path[str_detect(path, "user")]
+path_article <- path[!str_detect(path, "user")]
+
+da_wx_fwh_fan_num <- map_dfr(path_user, function(f) {
+  tmp <- readxl::read_xls(f)
+  tmp[-c(1, 2), ] |> `colnames<-`(tmp[1, ])
+}) |>
+  mutate(日期 = as.POSIXct("2023-01-01", tz = "UTC") + (as.numeric(时间) - 44927) * 3600 * 24) |>
+  dplyr::select(-时间) |>
+  relocate(日期)
+```
+
+### Article Performance
+
+```{r wx-svc-articles}
+da_wx_fwh_article <- map_dfr(path_article, readxl::read_xls) |>
+  mutate(发表时间 = as.POSIXct(发表时间, format = "%Y%m%d", tz = "UTC")) |>
+  arrange(发表时间)
+```
+
+### Combined WeChat Account Summary
+
+```{r wx-combined-current-fans}
+# Latest follower count (day before this_mon)
+da_wx_tmp1 <-
+  bind_rows(
+    da_wx_fan_num    |> mutate(账号 = "七幕-订阅号"),
+    da_wx_fwh_fan_num |> mutate(账号 = "七幕人生-服务号")
+  ) |>
+  filter(日期 >= date_this_mon - 3600 * 24, 日期 < date_this_mon) |>
+  dplyr::select(粉丝数 = 累积关注人数, 账号) |>
+  mutate(粉丝数 = as.numeric(粉丝数))
+```
+
+```{r wx-combined-fan-change}
+# Net follower change over the reporting week
+da_wx_tmp2 <-
+  bind_rows(
+    da_wx_fan_num    |> mutate(账号 = "七幕-订阅号"),
+    da_wx_fwh_fan_num |> mutate(账号 = "七幕人生-服务号")
+  ) |>
+  filter(日期 >= date_last_mon, 日期 < date_this_mon) |>
+  group_by(账号) |>
+  summarise(上周粉丝数变化 = sum(as.numeric(新关注人数)) - sum(as.numeric(取消关注人数)))
+```
+
+```{r wx-combined-content}
+# Content metrics for the reporting week
+da_wx_tmp3 <-
+  bind_rows(
+    da_wx_article    |> mutate(账号 = "七幕-订阅号"),
+    da_wx_fwh_article |> mutate(账号 = "七幕人生-服务号")
+  ) |>
+  filter(发表时间 >= date_last_mon, 发表时间 < date_this_mon) |>
+  group_by(账号) |>
+  summarise(
+    内容数目 = n(),
+    总观看量 = sum(as.numeric(总阅读次数)),
+    总互动量 = "-",
+    总分享   = sum(as.numeric(总分享次数))
+  )
+```
+
+```{r wx-summary-merge}
+da_wx_summary <-
+  da_wx_tmp1 |>
+  full_join(da_wx_tmp2, by = "账号") |>
+  full_join(da_wx_tmp3, by = "账号") |>
+  mutate(
+    平台     = "微信",
+    内容数目 = coalesce(内容数目, 0L),
+    总观看量 = coalesce(总观看量, 0),
+    总互动量 = coalesce(总互动量, "0"),
+    总分享   = coalesce(总分享, 0)
+  )
+```
+
+## WeChat Video Account (视频号)
+
+### Follower Count
+
+```{r wxvideo-fans}
+path      <- list.files("E:/实习工作/数据/市场端数据分析/七幕-视频号", full.names = TRUE)
+path_user <- path[str_detect(path, "关注者增长详情数据")]
+path_video <- path[!is.element(path, path_user)]
+
+# Files must be opened and re-saved before reading
+da_wxsp_fan_num <- map_dfr(path_user, function(f) {
+  tmp <- read.csv(f)
+  tmp[-c(1, 2), ] |> `colnames<-`(tmp[2, ]) |> `rownames<-`(NULL)
+}) |>
+  mutate(时间 = as.POSIXct(时间, format = "%Y/%m/%d", tz = "UTC"))
+
+da_wxsp_tmp1 <-
+  da_wxsp_fan_num |>
+  filter(时间 >= date_this_mon - 3600 * 24, 时间 < date_this_mon) |>
+  dplyr::select(粉丝数 = 关注者总数) |>
+  mutate(粉丝数 = as.numeric(粉丝数))
+
+da_wxsp_tmp2 <-
+  da_wxsp_fan_num |>
+  filter(时间 >= date_last_mon, 时间 < date_this_mon) |>
+  summarise(上周粉丝数变化 = sum(as.numeric(新增关注)) - sum(as.numeric(取消关注))) |>
+  mutate(上周粉丝数变化 = as.numeric(上周粉丝数变化))
+```
+
+### Video Performance
+
+```{r wxvideo-content}
+da_wx_video <- map_dfr(path_video, read.csv) |>
+  mutate(发布时间 = as.POSIXct(发布时间, format = "%Y/%m/%d", tz = "UTC"))
+
+da_wxsp_tmp3 <-
+  da_wx_video |>
+  filter(发布时间 >= date_last_mon, 发布时间 < date_this_mon) |>
+  summarise(
+    内容数目 = n(),
+    总观看量 = sum(播放量),
+    总互动量 = sum(推荐) + sum(喜欢) + sum(评论量),
+    总分享   = sum(分享量)
+  )
+
+da_wx_video_summary <-
+  da_wxsp_tmp1 |>
+  bind_cols(da_wxsp_tmp2) |>
+  bind_cols(da_wxsp_tmp3) |>
+  mutate(账号 = "七幕-视频号", 平台 = "微信", 总互动量 = as.character(总互动量))
+```
+
+## Training Subscription Account (培训-订阅号)
+
+```{r px-sub-fans}
+path         <- list.files("E:/实习工作/数据/市场端数据分析/培训-订阅号", full.names = TRUE)
+path_user    <- path[str_detect(path, "user")]
+path_article <- path[!str_detect(path, "user")]
+
+da_px_fan_num <- map_dfr(path_user, function(f) {
+  tmp <- readxl::read_xls(f)
+  tmp[-c(1, 2), ] |> `colnames<-`(tmp[1, ])
+}) |>
+  mutate(日期 = as.POSIXct("2023-01-01", tz = "UTC") + (as.numeric(时间) - 44927) * 3600 * 24) |>
+  dplyr::select(-时间) |>
+  relocate(日期)
+
+da_px_article <- map_dfr(path_article, readxl::read_xls) |>
+  mutate(发表时间 = as.POSIXct(发表时间, format = "%Y%m%d", tz = "UTC")) |>
+  arrange(发表时间)
+```
+
+```{r px-summary}
+da_px_tmp1 <-
+  da_px_fan_num |>
+  mutate(账号 = "七幕少儿剧团-订阅号") |>
+  filter(日期 >= date_this_mon - 3600 * 24, 日期 < date_this_mon) |>
+  dplyr::select(粉丝数 = 累积关注人数, 账号) |>
+  mutate(粉丝数 = as.numeric(粉丝数))
+
+da_px_tmp2 <-
+  da_px_fan_num |>
+  mutate(账号 = "七幕少儿剧团-订阅号") |>
+  filter(日期 >= date_last_mon, 日期 < date_this_mon) |>
+  group_by(账号) |>
+  summarise(上周粉丝数变化 = sum(as.numeric(新关注人数)) - sum(as.numeric(取消关注人数)))
+
+da_px_tmp3 <-
+  da_px_article |>
+  mutate(账号 = "七幕少儿剧团-订阅号") |>
+  filter(发表时间 >= date_last_mon, 发表时间 < date_this_mon) |>
+  group_by(账号) |>
+  summarise(
+    内容数目 = n(),
+    总观看量 = sum(as.numeric(总阅读次数)),
+    总互动量 = "-",
+    总分享   = sum(as.numeric(总分享次数))
+  )
+
+da_px_summary <-
+  da_px_tmp1 |>
+  full_join(da_px_tmp2, by = "账号") |>
+  full_join(da_px_tmp3, by = "账号") |>
+  mutate(
+    平台     = "微信",
+    内容数目 = coalesce(内容数目, 0L),
+    总观看量 = coalesce(总观看量, 0),
+    总互动量 = coalesce(总互动量, "0"),
+    总分享   = coalesce(总分享, 0)
+  )
+```
+
+## Training Video Account (培训-视频号)
+
+```{r pxvideo}
+path       <- list.files("E:/实习工作/数据/市场端数据分析/培训-视频号", full.names = TRUE)
+path_user  <- path[str_detect(path, "关注者增长详情数据")]
+path_video <- path[!is.element(path, path_user)]
+
+da_pxsp_fan_num <- map_dfr(path_user, function(f) {
+  tmp <- read.csv(f)
+  tmp[-c(1, 2), ] |> `colnames<-`(tmp[2, ]) |> `rownames<-`(NULL)
+}) |>
+  mutate(时间 = as.POSIXct(时间, format = "%Y/%m/%d", tz = "UTC"))
+
+da_pxsp_tmp1 <-
+  da_pxsp_fan_num |>
+  filter(时间 >= date_this_mon - 3600 * 24, 时间 < date_this_mon) |>
+  dplyr::select(粉丝数 = 关注者总数) |>
+  mutate(粉丝数 = as.numeric(粉丝数))
+
+da_pxsp_tmp2 <-
+  da_pxsp_fan_num |>
+  filter(时间 >= date_last_mon, 时间 < date_this_mon) |>
+  summarise(上周粉丝数变化 = sum(as.numeric(新增关注)) - sum(as.numeric(取消关注))) |>
+  mutate(上周粉丝数变化 = as.numeric(上周粉丝数变化))
+
+da_px_video <- map_dfr(path_video, read.csv) |>
+  mutate(发布时间 = as.POSIXct(发布时间, format = "%Y/%m/%d", tz = "UTC"))
+
+da_pxsp_tmp3 <-
+  da_px_video |>
+  filter(发布时间 >= date_last_mon, 发布时间 < date_this_mon) |>
+  summarise(
+    内容数目 = n(),
+    总观看量 = sum(播放量),
+    总互动量 = sum(推荐) + sum(喜欢) + sum(评论量),
+    总分享   = sum(分享量)
+  )
+
+da_px_video_summary <-
+  da_pxsp_tmp1 |>
+  bind_cols(da_pxsp_tmp2) |>
+  bind_cols(da_pxsp_tmp3) |>
+  mutate(账号 = "七幕少儿剧团-视频号", 平台 = "微信", 总互动量 = as.character(总互动量))
+```
+
+## Cross-Platform Follower Data (Weibo / Bilibili / Douyin / XHS)
+
+```{r cross-platform-path}
+# Shared workbook covering Weibo, Bilibili, Douyin, and Xiaohongshu
+path_wb_bili_xhs <- "E:/实习工作/数据/市场端数据分析/微博&抖音&b站视频数据统计/微博&抖音&b站视频数据统计12-25.xlsx"
+```
+
+```{r cross-platform-fans}
+da_fan_num <- readxl::read_xlsx(path_wb_bili_xhs, sheet = 1, col_names = TRUE)
+
+# Map short platform labels to (platform, account_name) pairs
+mark_account <- function(text) {
+  l      <- length(text)
+  ans_m  <- matrix(rep("", 2 * l), 2, l)
+  ans_m[, text == "微博-七幕"]         <- c("微博",   "七幕人生sevenages")
+  ans_m[, text == "微博-法扎"]         <- c("微博",   "音乐剧摇滚莫扎特中文版")
+  ans_m[, text == "b站"]               <- c("b站",    "七幕人生sevenages")
+  ans_m[, text == "抖音"]              <- c("抖音",   "七幕人生")
+  ans_m[, text == "小红书"]            <- c("小红书", "七幕人生")
+  ans_m[, text == "小红书-七幕少儿剧团"] <- c("小红书", "七幕少儿剧团")
+  unknown <- which(ans_m == "")
+  if (length(unknown)) {
+    print(unique(text[(unknown + 1) %/% 2]))
+    warning("mark_account: unrecognised platform label")
+  }
+  t(ans_m)
+}
+
+# Build weekly follower-count summary (this Monday vs last Monday)
+da_fan_num_summary <-
+  da_fan_num |>
+  arrange(desc(统计时间)) |>
+  head(2) |>
+  mutate(统计时间 = c("本周一", "上周一")) |>
+  pivot_longer(cols = 2:7, names_to = "账号", values_to = "粉丝数") |>
+  pivot_wider(names_from = 统计时间, values_from = 粉丝数) |>
+  mutate(
+    粉丝变化 = 本周一 - 上周一,
+    平台     = mark_account(账号)[, 1],
+    账号     = mark_account(账号)[, 2]
+  ) |>
+  dplyr::select(账号, 粉丝数 = 本周一, 上周粉丝数变化 = 粉丝变化, 平台)
+```
+
+## Weibo
+
+```{r weibo}
+# Helper: convert "1.5W" / "2W" style strings to numeric
+mark_num_wb <- function(text) {
+  ans <- text
+  pat  <- regex("(\\d*?\\.\\d*?)[Ww]$")
+  pat2 <- regex("(^\\d*?)[Ww]$")
+  ans[str_detect(text, pat)]  <- as.character(as.numeric(str_match(text[str_detect(text, pat)],  pat)[, 2]) * 10000)
+  ans[str_detect(text, pat2)] <- as.character(as.numeric(str_match(text[str_detect(text, pat2)], pat2)[, 2]) * 10000)
+  as.numeric(ans)
+}
+
+read_wb_sheet <- function(sheet_idx, account_name) {
+  tmp <- readxl::read_xlsx(path_wb_bili_xhs, sheet = sheet_idx, col_names = TRUE)
+  tmp[-1, ] |>
+    `colnames<-`(tmp[1, ]) |>
+    mutate(
+      投稿时间 = as.POSIXct("2023-10-10", tz = "UTC") + (as.numeric(投稿时间) - 45209) * 3600 * 24,
+      账号     = account_name
+    )
+}
+
+da_wb1 <- read_wb_sheet(2, "七幕人生sevenages")
+da_wb2 <- read_wb_sheet(3, "音乐剧摇滚莫扎特中文版")
+
+summarise_wb <- function(da_wb, account_name) {
+  da_wb |>
+    filter(投稿时间 >= date_last_mon, 投稿时间 < date_this_mon) |>
+    mutate(阅读数 = mark_num_wb(阅读数)) |>
+    summarise(
+      内容数目 = n(),
+      总观看量 = sum(阅读数),
+      总互动量 = as.character(sum(as.numeric(评论数)) + sum(as.numeric(点赞数))),
+      总分享   = sum(as.numeric(转发数))
+    ) |>
+    mutate(平台 = "微博", 账号 = account_name)
+}
+
+da_wb_summary <-
+  bind_rows(summarise_wb(da_wb1, "七幕人生sevenages"),
+            summarise_wb(da_wb2, "音乐剧摇滚莫扎特中文版")) |>
+  left_join(da_fan_num_summary, by = c("平台", "账号"))
+```
+
+## Bilibili
+
+```{r bilibili}
+da_bilibili_tmp <- readxl::read_xlsx(path_wb_bili_xhs, sheet = 4, col_names = TRUE)
+da_bilibili <- da_bilibili_tmp[-1, ] |>
+  `colnames<-`(da_bilibili_tmp[1, ]) |>
+  mutate(投稿时间 = as.POSIXct("2023-10-10", tz = "UTC") + (as.numeric(投稿时间) - 45209) * 3600 * 24)
+
+da_bilibili_summary <-
+  da_bilibili |>
+  filter(投稿时间 >= date_last_mon, 投稿时间 < date_this_mon) |>
+  summarise(
+    内容数目 = n(),
+    总观看量 = sum(as.numeric(播放量)),
+    总互动量 = as.character(
+      sum(as.numeric(点赞数)) + sum(as.numeric(弹幕数)) +
+      sum(as.numeric(评论数)) + sum(as.numeric(收藏数)) + sum(as.numeric(硬币数))
+    ),
+    总分享 = sum(as.numeric(分享数))
+  ) |>
+  mutate(账号 = "七幕人生sevenages", 平台 = "b站") |>
+  left_join(da_fan_num_summary, by = c("平台", "账号"))
+```
+
+## Douyin
+
+```{r douyin}
+da_dy_tmp <- readxl::read_xlsx(path_wb_bili_xhs, sheet = 5, col_names = TRUE)
+da_dy <- da_dy_tmp[-1, ] |>
+  `colnames<-`(da_dy_tmp[1, ]) |>
+  mutate(投稿时间 = as.POSIXct("2023-10-10", tz = "UTC") + (as.numeric(投稿时间) - 45209) * 3600 * 24) |>
+  filter(!is.na(播放量))
+
+da_dy_summary <-
+  da_dy |>
+  filter(投稿时间 >= date_last_mon, 投稿时间 < date_this_mon) |>
+  summarise(
+    内容数目 = n(),
+    总观看量 = sum(as.numeric(播放量)),
+    总互动量 = as.character(
+      sum(as.numeric(点赞数)) + sum(as.numeric(评论数)) + sum(as.numeric(收藏))
+    ),
+    总分享 = sum(as.numeric(转发数))
+  ) |>
+  mutate(账号 = "七幕人生", 平台 = "抖音") |>
+  left_join(da_fan_num_summary, by = c("平台", "账号"))
+```
+
+## Xiaohongshu (XHS)
+
+```{r xhs}
+# Helper: convert "1.5万" style strings to numeric
+mark_num_xhs <- function(text) {
+  pat <- regex("(\\d*?\\.\\d*?)万$")
+  ans <- text
+  ans[str_detect(text, pat)] <- as.character(
+    as.numeric(str_match(text[str_detect(text, pat)], pat)[, 2]) * 10000
+  )
+  as.numeric(ans)
+}
+
+# Parse graphic-post data scraped from XHS creator dashboard (HTML/text export)
+parse_xhs_posts <- function(lines, col_offsets) {
+  id_list <- which(str_detect(lines, "info-text"))[-1]
+  as.data.frame(
+    str_split_fixed(lines[id_list], regex("<[:print:]*?>"), n = Inf)
+  )[, c(3, 5)] |>
+    bind_cols(
+      as.data.frame(
+        str_split_fixed(lines[id_list + 2], regex("<[:print:]*?>"), n = Inf)
+      )[, col_offsets]
+    )
+}
+
+da_red    <- read_lines("E:/实习工作/数据/市场端数据分析/小红书后台数据/小红书创作服务平台-1.txt")
+da_red_v1 <- read_lines("E:/实习工作/数据/市场端数据分析/小红书后台数据/小红书创作服务平台-v1.txt")
+da_red_v2 <- read_lines("E:/实习工作/数据/市场端数据分析/小红书后台数据/小红书创作服务平台-v2.txt")
+
+# Graphic posts
+id_list <- which(str_detect(da_red, "info-text"))[-1]
+da_red_edit <- as.data.frame(
+  str_split_fixed(da_red[id_list], regex("<[:print:]*?>"), n = Inf)
+)[, c(3, 5)] |>
+  bind_cols(
+    as.data.frame(str_split_fixed(da_red[id_list + 2], regex("<[:print:]*?>"), n = Inf)
+    )[, c(8, 10, 17, 19, 25, 27, 35, 37, 44, 46)]
+  ) |>
+  pivot_wider(names_from = V8,  values_from = V10) |>
+  pivot_wider(names_from = V17, values_from = V19) |>
+  pivot_wider(names_from = V25, values_from = V27) |>
+  pivot_wider(names_from = V35, values_from = V37) |>
+  pivot_wider(names_from = V44, values_from = V46) |>
+  `colnames<-`(c("标题", "发布时间", colnames(.)[-c(1, 2)])) |>
+  mutate(发布时间 = as.POSIXct(发布时间, format = "发布于 %Y-%m-%d", tz = "UTC"))
+
+# Video posts (two batches merged)
+parse_xhs_video <- function(lines) {
+  id_list <- which(str_detect(lines, "info-text"))[-1]
+  as.data.frame(str_split_fixed(lines[id_list], regex("<[:print:]*?>"), n = Inf))[, c(3, 5)] |>
+    bind_cols(
+      as.data.frame(str_split_fixed(lines[id_list + 2], regex("<[:print:]*?>"), n = Inf)
+      )[, c(8, 10, 16, 18, 24, 26, 32, 34, 42, 44, 50, 52, 58, 60, 66, 68)]
+    )
+}
+
+da_red_v_edit <-
+  bind_rows(parse_xhs_video(da_red_v1), parse_xhs_video(da_red_v2)) |>
+  pivot_wider(names_from = V8,  values_from = V10) |>
+  pivot_wider(names_from = V16, values_from = V18) |>
+  pivot_wider(names_from = V24, values_from = V26) |>
+  pivot_wider(names_from = V32, values_from = V34) |>
+  pivot_wider(names_from = V42, values_from = V44) |>
+  pivot_wider(names_from = V50, values_from = V52) |>
+  pivot_wider(names_from = V58, values_from = V60) |>
+  pivot_wider(names_from = V66, values_from = V68) |>
+  `colnames<-`(c("标题", "发布时间", colnames(.)[-c(1, 2)])) |>
+  mutate(发布时间 = as.POSIXct(发布时间, format = "发布于 %Y-%m-%d", tz = "UTC"))
+
+# Summarise graphic + video posts for the week
+da_xhs_tmp1 <-
+  da_red_edit |>
+  filter(发布时间 >= date_last_mon, 发布时间 < date_this_mon) |>
+  summarise(
+    内容数目 = n(),
+    总观看量 = sum(as.numeric(观看量)),
+    总互动量 = as.character(sum(as.numeric(点赞量)) + sum(as.numeric(收藏数)) + sum(as.numeric(评论数))),
+    总分享   = sum(as.numeric(分享数))
+  ) |>
+  mutate(账号 = "七幕人生")
+
+da_xhs_tmp2 <-
+  da_red_v_edit |>
+  filter(发布时间 >= date_last_mon, 发布时间 < date_this_mon) |>
+  mutate(观看量 = mark_num_xhs(观看量)) |>
+  summarise(
+    内容数目 = n(),
+    总观看量 = sum(as.numeric(观看量)),
+    总互动量 = as.character(
+      sum(as.numeric(点赞量)) + sum(as.numeric(收藏数)) +
+      sum(as.numeric(评论数)) + sum(as.numeric(弹幕数))
+    ),
+    总分享 = sum(as.numeric(分享数))
+  ) |>
+  mutate(账号 = "七幕人生")
+
+da_xhs_summary <-
+  bind_rows(da_xhs_tmp1, da_xhs_tmp2) |>
+  summarise(
+    内容数目 = sum(内容数目),
+    总观看量 = sum(总观看量),
+    总互动量 = as.character(sum(as.numeric(总互动量))),
+    总分享   = sum(总分享)
+  ) |>
+  mutate(平台 = "小红书", 账号 = "七幕人生") |>
+  left_join(da_fan_num_summary, by = c("平台", "账号")) |>
+  full_join(
+    da_fan_num_summary |> filter(平台 == "小红书"),
+    by = c("平台", "账号", "粉丝数", "上周粉丝数变化")
+  )
+```
+
+## Enterprise WeChat (企微)
+
+```{r qywx}
+path <- list.files("E:/实习工作/数据/市场端数据分析/七幕-企微客服", full.names = TRUE)
+
+da_qywx_fan_num <- map_dfr(path, readxl::read_xlsx) |>
+  mutate(
+    日期       = as.Date(日期),
+    净增客户数 = as.numeric(str_replace(净增客户数, "'", ""))
+  ) |>
+  arrange(日期)
+
+da_qywx_tmp1 <-
+  da_qywx_fan_num |>
+  filter(日期 >= date_this_mon - 3600 * 24, 日期 < date_this_mon) |>
+  dplyr::select(粉丝数 = 客户总数) |>
+  mutate(粉丝数 = as.numeric(粉丝数))
+
+da_qywx_tmp2 <-
+  da_qywx_fan_num |>
+  filter(日期 >= date_last_mon - 3600 * 24, 日期 < date_last_mon) |>
+  dplyr::select(粉丝数_prev = 客户总数) |>
+  mutate(粉丝数_prev = as.numeric(粉丝数_prev)) |>
+  mutate(上周粉丝数变化 = da_qywx_tmp1$粉丝数 - 粉丝数_prev) |>
+  dplyr::select(上周粉丝数变化)
+
+da_qywx_summary <-
+  da_qywx_tmp1 |>
+  bind_cols(da_qywx_tmp2) |>
+  mutate(账号 = "客服-企微", 平台 = "微信")
+```
+
+## Consolidated Cross-Platform Summary
+
+```{r channel-attribution}
+# Map referral (渠道明细) labels to the owning social account
+mark_zhanghao_da <- function(text) {
+  l     <- length(text)
+  ans_m <- matrix(rep("无", 2 * l), 2, l)
+
+  list_dyh <- c(
+    unique(text[str_sub(text, 1, 2) == "推文"]),
+    "订阅号-MOR", "订阅号-MA",
+    "公众号展示-上海", "公众号展示-北京", "公众号展示-深圳",
+    "订阅号展示-MA", "订阅号展示-MOR"
+  )
+  list_fwh <- c(
+    unique(text[str_sub(text, 1, 5) == "服务号推文"]),
+    "服务号-MOR", "服务号-MA", "服务号展示-MA", "服务号展示-MOR"
+  )
+  list_wb <- unique(text[str_sub(text, 1, 2) == "微博"])
+  list_qw <- c(
+    unique(text[is.element(str_sub(text, 1, 5), c("企微朋友圈", "培训企微群", "小七点对点", "培训点对点"))]),
+    unique(text[str_sub(text, 1, 3) == "企微群"]),
+    unique(text[str_sub(text, 1, 6) == "小七自动回复"]),
+    unique(text[str_sub(text, 1, 8) == "培训-企微朋友圈"])
+  )
+
+  ans_m[, is.element(text, list_dyh)] <- c("七幕-订阅号",    "微信")
+  ans_m[, is.element(text, list_fwh)] <- c("七幕人生-服务号", "微信")
+  ans_m[, is.element(text, list_qw)]  <- c("客服-企微",       "微信")
+  ans_m[, is.element(text, list_wb)]  <- c("七幕人生sevenages", "微博")
+
+  t(ans_m)
+}
+
+da_for_market_summary <-
+  da_for_market |>
+  filter(下单时间 >= date_last_mon, 下单时间 < date_this_mon) |>
+  mutate(
+    账号 = mark_zhanghao_da(渠道明细)[, 1],
+    平台 = mark_zhanghao_da(渠道明细)[, 2]
+  ) |>
+  filter(账号 != "无") |>
+  group_by(平台, 账号) |>
+  summarise(
+    售票数 = sum(张数),
+    收入   = sum(实收),
+    .groups = "drop"
+  )
+```
+
+```{r final-summary}
+# Full cross-platform weekly report table
+bind_rows(
+  da_wx_summary,
+  da_wx_video_summary,
+  da_px_summary,
+  da_px_video_summary,
+  da_qywx_summary,
+  da_wb_summary,
+  da_dy_summary,
+  da_xhs_summary,
+  da_bilibili_summary
+) |>
+  full_join(da_for_market_summary, by = c("账号", "平台")) |>
+  relocate(平台, 账号) |>
+  dplyr::select(-平台) |>
+  mutate(across(c(售票数, 收入, 内容数目, 总观看量, 总互动量, 总分享),
+                ~ coalesce(as.character(.), "-")))
+```

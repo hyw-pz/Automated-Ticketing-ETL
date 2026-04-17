@@ -1,0 +1,861 @@
+---
+title: "NTN Daily Report"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-location: body
+    toc-depth: 3
+    number-sections: true
+execute:
+  echo: false
+---
+
+## Data Ingestion
+
+```{r setup}
+options(scipen = 20)
+source("D:/日报通用函数.R")
+```
+
+### Direct (self-operated) channel
+
+```{r direct-sales}
+list_tmp        <- rep(list("?"), 50)
+list_tmp[c(2:3, 6:9, 28)] <- "c"
+
+da_ntn <- read_csv(
+  "D:/选座明细.csv",
+  show_col_types = FALSE,
+  col_types = list_tmp
+) |>
+  mutate(下单时间 = as.POSIXct(下单时间, tz = "UTC")) |>
+  filter(
+    项目      != "测试",
+    地址信息  != "测试",
+    下单时间  >= as.POSIXct("2024-01-23 15:00:00", tz = "UTC")
+  ) |>
+  # Distributor channel support to be added later
+  mutate(剧目 = mark_musicals(项目)) |>
+  filter(剧目 == "NTN") |>
+  mutate(
+    场次       = as.POSIXct(paste0(开始时间, ":00"), tz = "UTC"),
+    渠道类型   = "自营",
+    渠道明细   = mark_from(分销码, 下单时间)[, 1],
+    动作日期   = mark_from(分销码, 下单时间)[, 2],
+    动作类型   = mark_from(分销码, 下单时间)[, 3],
+    实收       = 结算金额,
+    张数       = 1,
+    地址       = 地址信息,
+    收货人手机 = as.character(收货人手机)
+  ) |>
+  mutate(
+    渠道类型 = mark_qudao_zy(动作类型),
+    下单时间 = as.character(下单时间),
+    剧场     = 场馆
+    # Revenue multiplier (ticket rebate) to be applied once logic is confirmed:
+    # 实收 = 实收 * as.numeric(mark_piaoti_zy(渠道类型, 渠道明细, "MA", 票价))
+  ) |>
+  dplyr::select(
+    场次, 下单时间, 渠道类型, 渠道明细, 动作日期, 动作类型,
+    票价, 实收, 张数, 收货人姓名, 收货人手机, 地址, 剧场, 剧目
+  ) -> da_ntn_edit
+```
+
+### Shenzhen Poly Theatre (venue report)
+
+```{r shenzhen-poly}
+# Read all daily venue reports from the Shenzhen Poly folder
+path  <- list.files("D:/实习工作-交接/NTN/深圳保利", full.names = TRUE)
+pat2  <- regex("[:print:]*场次汇总表([:print:]*)[.xlsx]{5}")
+pat   <- regex("([:print:]{2})[:print:]([:print:]*)")
+l     <- length(path)
+
+da_bl_tmp <- NULL
+for (i in seq_len(l)) {
+  da_bl <- readxl::read_xlsx(path[i], col_names = TRUE)
+
+  da_bl |>
+    dplyr::select(
+      "演出地址", "演出时间", "销售政策",
+      "A级_票价", "A级_已售数量", "A级_已售金额",
+      "B级_票价", "B级_已售数量", "B级_已售金额",
+      "C级_票价", "C级_已售数量", "C级_已售金额",
+      "D级_票价", "D级_已售数量", "D级_已售金额"
+    ) |>
+    pivot_longer(
+      cols      = c("A级_票价", "A级_已售数量", "A级_已售金额",
+                    "B级_票价", "B级_已售数量", "B级_已售金额",
+                    "C级_票价", "C级_已售数量", "C级_已售金额",
+                    "D级_票价", "D级_已售数量", "D级_已售金额"),
+      names_to  = "票属性",
+      values_to = "数值"
+    ) |>
+    mutate(
+      等级 = str_match(票属性, pat)[, 2],
+      属性 = str_match(票属性, pat)[, 3]
+    ) |>
+    dplyr::select(-票属性) |>
+    pivot_wider(names_from = 属性, values_from = 数值) |>
+    mutate(
+      场次     = as.POSIXct(演出时间, tz = "UTC"),
+      渠道类型 = "剧场"
+    ) |>
+    rename(票档 = 票价, 数量 = 已售数量, 金额 = 已售金额) |>
+    dplyr::select(渠道类型, 场次, 票档, 数量, 金额) |>
+    rename(张数 = 数量, 票价 = 票档, 实收 = 金额) |>
+    mutate(
+      剧场     = "深圳保利剧院",
+      下单时间 = as.POSIXct(
+        paste0("2024-", str_match(path[i], pat2)[, 2], " 00:00:00"),
+        tz = "UTC"
+      ),
+      票价     = as.numeric(票价)
+    ) |>
+    filter(张数 != 0 | 实收 != 0) |>
+    mutate(渠道明细 = "剧场", 下单时间 = as.character(下单时间), 剧目 = "NTN深圳") -> da_bind
+
+  da_bl_tmp <- bind_rows(da_bind, da_bl_tmp)
+}
+```
+
+### Guangdong Arts Theatre (venue report)
+
+```{r guangdong-arts}
+path  <- list.files("D:/实习工作-交接/NTN/广艺", full.names = TRUE)
+pat2  <- regex("[:print:]*广东艺术剧院([:print:]*)[.xlsx]{5}")
+pat   <- regex("^场次时间：([:print:]*)")
+l     <- length(path)
+
+da_gy_tmp <- NULL
+for (i in seq_len(l)) {
+  da_gy_ntn <- readxl::read_xlsx(path[i], col_names = FALSE)
+
+  da_gy_ntn |>
+    dplyr::select(c(1, 6, 15, 22)) |>
+    `colnames<-`(c("票价", "售票数", "剧院剩余", "收入")) |>
+    mutate(场次时间 = str_match(票价, pat)[, 2]) |>
+    filter(
+      is.element(票价, c("280元(280.00)", "480元(480.00)", "680元(680.00)", "880元(880.00)")) |
+        !is.na(场次时间)
+    ) |>
+    fill(场次时间) |>
+    filter(!is.na(售票数)) |>
+    mutate(
+      票价     = as.numeric(str_match(票价, regex("[0-9]*[(]([:print:]*)[)]"))[, 2]),
+      渠道类型 = "剧场",
+      渠道明细 = "剧场",
+      售票数   = as.numeric(售票数),
+      收入     = as.numeric(收入),
+      下单时间 = as.POSIXct(
+        paste0("2024-", str_match(path[i], pat2)[, 2], " 00:00:00"),
+        tz = "UTC"
+      ),
+      销售政策 = "早鸟",
+      剧目     = "NTN广州",
+      剧场     = "广东艺术剧院"
+    ) |>
+    mutate(场次 = as.POSIXct(场次时间, tz = "UTC"), 下单时间 = as.character(下单时间)) |>
+    rename(实收 = 收入, 张数 = 售票数) -> da_gy_bind
+
+  da_gy_tmp <- bind_rows(da_gy_bind, da_gy_tmp)
+}
+```
+
+### Maoyan (ticketing platform)
+
+```{r maoyan-shanghai}
+# Shanghai Maoyan order detail files
+path  <- list.files("D:/实习工作-交接/NTN/猫眼/上海", full.names = TRUE)
+pat2  <- regex("[:print:]*订单明细表([:print:]*)[.xlsx]{5}")
+l     <- length(path)
+
+da_shmy_tmp <- NULL
+for (i in seq_len(l)) {
+  da_shmy <- readxl::read_xls(path[i])
+
+  da_shmy |>
+    mutate(
+      剧目       = "NTN上海",
+      剧场       = 演出场馆,
+      场次       = as.POSIXct(演出时间, tz = "UTC"),
+      渠道类型   = "票务网站",
+      渠道明细   = "猫眼",
+      票价       = as.numeric(票面价),
+      实收       = as.numeric(现金支付),
+      张数       = as.numeric(票张数),
+      收货人姓名 = 收件人,
+      收货人手机 = as.character(收件人电话),
+      地址       = as.character(收件人地址)
+    ) |>
+    dplyr::select(剧目, 剧场, 场次, 下单时间, 渠道类型, 渠道明细,
+                  票价, 实收, 张数, 收货人姓名, 收货人手机, 地址) -> da_shmy_bind
+
+  da_shmy_tmp <- bind_rows(da_shmy_bind, da_shmy_tmp)
+}
+```
+
+```{r maoyan-beijing-shenzhen}
+# Beijing & Shenzhen Maoyan order detail files (single combined folder)
+path  <- list.files("D:/实习工作-交接/NTN/猫眼/北京深圳", full.names = TRUE)
+l     <- length(path)
+
+da_bjmy_tmp <- NULL
+da_szmy_tmp <- NULL
+for (i in seq_len(l)) {
+  da_my <- readxl::read_xls(path[i])
+
+  # --- Beijing ---
+  da_my |>
+    filter(演出城市 == "北京") |>
+    mutate(
+      剧目       = "NTN北京",
+      剧场       = 演出场馆,
+      场次       = as.POSIXct(演出时间, tz = "UTC"),
+      渠道类型   = "票务网站",
+      渠道明细   = "猫眼",
+      票价       = as.numeric(票面价),
+      实收       = as.numeric(现金支付),
+      张数       = as.numeric(票张数),
+      收货人姓名 = 收件人,
+      收货人手机 = as.character(收件人电话),
+      地址       = as.character(收件人地址)
+    ) |>
+    dplyr::select(剧目, 剧场, 场次, 下单时间, 渠道类型, 渠道明细,
+                  票价, 实收, 张数, 收货人姓名, 收货人手机, 地址) -> da_bjmy_bind
+  da_bjmy_tmp <- bind_rows(da_bjmy_bind, da_bjmy_tmp)
+
+  # --- Shenzhen ---
+  da_my |>
+    filter(演出城市 == "深圳") |>
+    mutate(
+      剧目       = "NTN深圳",
+      剧场       = 演出场馆,
+      场次       = as.POSIXct(演出时间, tz = "UTC"),
+      渠道类型   = "票务网站",
+      渠道明细   = "猫眼",
+      票价       = as.numeric(票面价),
+      实收       = as.numeric(现金支付),
+      张数       = as.numeric(票张数),
+      收货人姓名 = 收件人,
+      收货人手机 = as.character(收件人电话),
+      地址       = as.character(收件人地址)
+    ) |>
+    dplyr::select(剧目, 剧场, 场次, 下单时间, 渠道类型, 渠道明细,
+                  票价, 实收, 张数, 收货人姓名, 收货人手机, 地址) -> da_szmy_bind
+  da_szmy_tmp <- bind_rows(da_szmy_bind, da_szmy_tmp)
+}
+```
+
+### Shanghai Conservatory Opera House (上音歌剧院)
+
+```{r shanghai-conservatory}
+# Venue sends a CSV summary; rows 1-5 contain the relevant session data.
+# Price tiers present depend on which have gone on sale; handle both 1-tier
+# and 2-tier layouts with a conditional branch.
+path  <- list.files("D:/实习工作-交接/NTN/上音", full.names = TRUE)
+pat2  <- regex("[:print:]*上音([:print:]*)[.csv]{4}")
+l     <- length(path)
+
+da_sy_tmp <- NULL
+for (i in seq_len(l)) {
+  da_sy <- read_csv(path[i], skip = 1, show_col_types = FALSE, col_types = list_tmp)
+  da_sy <- da_sy[1:5, ]
+  da_sy <- na.omit(da_sy)
+
+  # Tier 1: 680 CNY (columns 2 & 5)
+  da_sy |>
+    dplyr::select(c(2, 5)) |>
+    `colnames<-`(c("场次", "张数")) |>
+    mutate(票价 = 680) -> da_sy1
+
+  if (ncol(da_sy) >= 8) {
+    # Tier 2: 880 CNY (columns 2 & 7) — available once that tier opens
+    da_sy |>
+      dplyr::select(c(2, 7)) |>
+      `colnames<-`(c("场次", "张数")) |>
+      mutate(票价 = 880, 张数 = as.numeric(张数)) -> da_sy2
+
+    da_sy1 |>
+      bind_rows(da_sy2) -> da_sy_combined
+  } else {
+    da_sy_combined <- da_sy1
+  }
+
+  da_sy_combined |>
+    mutate(
+      场次       = as.POSIXct(场次, format = "%Y年%m月%d日 %H:%M:%S", tz = "UTC"),
+      渠道类型   = "剧场",
+      渠道明细   = "剧场",
+      实收       = 票价 * 张数,
+      剧目       = "NTN上海",
+      剧场       = "上音歌剧院",
+      下单时间   = as.POSIXct(
+        paste0("2024-", str_match(path[i], pat2)[, 2], " 00:00:00"),
+        tz = "UTC"
+      )
+    ) |>
+    mutate(下单时间 = as.character(下单时间)) -> da_sy_bind
+
+  da_sy_tmp <- bind_rows(da_sy_tmp, da_sy_bind)
+  # Placeholders for additional tiers if/when they are added:
+  # else if (ncol(da_sy) >= 10) { ... }
+  # else if (ncol(da_sy) >= 12) { ... }
+}
+```
+
+---
+
+## Consolidated Master Table
+
+```{r consolidate}
+# Combine all channels into one wide table and annotate project
+da_all_ntn <- da_ntn_edit |>
+  bind_rows(da_bl_tmp)  |>
+  bind_rows(da_gy_tmp)  |>
+  bind_rows(da_shmy_tmp)|>
+  bind_rows(da_bjmy_tmp)|>
+  bind_rows(da_szmy_tmp)|>
+  bind_rows(da_sy_tmp)  |>
+  mutate(下单时间 = as.POSIXct(下单时间, tz = "UTC")) |>
+  mutate(项目 = mark_jm(剧场))  |>    # venue → project label
+  filter(!is.na(场次))           |>
+  dplyr::select(-剧目)
+```
+
+---
+
+## Cumulative Revenue by Venue
+
+```{r cumulative-revenue}
+da_all_ntn |>
+  filter(下单时间 < date_tomorrow) |>
+  group_by(剧场) |>
+  summarise(收入 = sum(实收), .groups = "drop") |>
+  pivot_wider(names_from = 剧场, values_from = 收入) |>
+  dplyr::select(二七剧场, 上音歌剧院, 广东艺术剧院, 深圳保利剧院) |>
+  knitr::kable()
+```
+
+---
+
+## Daily Incremental Revenue
+
+```{r daily-revenue}
+# Aggregate today's sales by channel type and venue
+da_all_ntn |>
+  mutate(渠道类型 = if_else(
+    is.element(渠道类型, c("分销-系统", "分销-报单")), "分销", 渠道类型
+  )) |>
+  filter(下单时间 >= date_today, 下单时间 < date_tomorrow) |>
+  group_by(渠道类型, 剧场) |>
+  summarise(售票数 = sum(张数), 收入 = sum(实收), .groups = "drop") |>
+  mutate(
+    售票数 = coalesce(售票数, 0),
+    收入   = coalesce(收入,   0)
+  ) |>
+  pivot_longer(售票数:收入, names_to = "类型", values_to = "数值") |>
+  pivot_wider(names_from = 剧场, values_from = 数值) |>
+  mutate(渠道 = paste0(渠道类型, 类型)) |>
+  relocate(渠道) |>
+  arrange(desc(渠道)) -> tmp
+
+# Ensure all venue columns exist even when there were no sales that day
+for (col in c("二七剧场", "上音歌剧院", "广东艺术剧院", "深圳保利剧院")) {
+  if (!is.element(col, colnames(tmp))) tmp <- tmp |> mutate(!!col := NA)
+}
+
+coerce_col <- function(df, col) {
+  df |> mutate(!!col := coalesce(as.character(.data[[col]]), "0"))
+}
+
+tmp_self_dist <- tmp |>
+  filter(is.element(渠道类型, c("自营", "分销")))
+
+tmp_other <- tmp |>
+  filter(!is.element(渠道类型, c("自营", "分销", "大客户")))
+
+tmp_bulk <- tmp |>
+  filter(is.element(渠道类型, "大客户"))
+
+for (col in c("二七剧场", "上音歌剧院", "广东艺术剧院", "深圳保利剧院")) {
+  tmp_self_dist <- coerce_col(tmp_self_dist, col)
+  tmp_other     <- coerce_col(tmp_other,     col)
+  tmp_bulk      <- coerce_col(tmp_bulk,      col)
+}
+
+tmp_self_dist <- tmp_self_dist |> arrange(desc(渠道类型), 类型)
+tmp_other     <- tmp_other     |> arrange(desc(渠道类型), 类型)
+tmp_bulk      <- tmp_bulk      |> arrange(desc(渠道类型), 类型)
+
+# Full summary table (with channel labels)
+tmp_self_dist |>
+  bind_rows(tmp_other) |>
+  bind_rows(tmp_bulk)  |>
+  dplyr::select(渠道, 二七剧场, 上音歌剧院, 广东艺术剧院, 深圳保利剧院)
+
+# Numeric-only summary table (without channel labels)
+tmp_self_dist |>
+  bind_rows(tmp_other) |>
+  bind_rows(tmp_bulk)  |>
+  dplyr::select(二七剧场, 上音歌剧院, 广东艺术剧院, 深圳保利剧院)
+```
+
+---
+
+## Direct Sales Breakdown
+
+```{r direct-breakdown}
+if (is.element("自营", tmp$渠道类型)) {
+  da_all_ntn |>
+    filter(
+      下单时间 >= date_today, 下单时间 < date_tomorrow,
+      渠道类型 == "自营"
+    ) |>
+    # Collapse article-push sub-types into a single "推文" category
+    mutate(动作类型 = if_else(
+      is.element(动作类型, c("推文-开票", "推文-仅销售", "推文-含品宣")),
+      "推文", 动作类型
+    )) |>
+    group_by(动作日期, 渠道明细, 动作类型, 下单时间, 收货人姓名, 收货人手机) |>
+    summarise(张数 = sum(张数), 实收 = sum(实收), .groups = "drop") |>
+    group_by(动作日期, 渠道明细, 动作类型) |>
+    summarise(订单数 = n(), 售票数 = sum(张数), 收入 = sum(实收), .groups = "drop") |>
+    arrange(动作类型, 渠道明细, desc(动作日期), desc(收入)) |>
+    relocate(-动作日期) |>
+    left_join(da_move4, by = join_by(渠道明细 == 自营动作, 动作类型, 动作日期)) |>
+    rename(自营动作 = 渠道明细, 累计ROI = ROI) |>
+    mutate(`阅读/发送人数` = as.numeric(`阅读/发送人数`)) |>
+    mutate(
+      订单转化率 = if_else(
+        is.na(`阅读/发送人数`), "",
+        paste0(round(订单数 / `阅读/发送人数` * 100, digits = 3), "%")
+      ),
+      售票转化率 = if_else(
+        is.na(`阅读/发送人数`), "",
+        paste0(round(售票数 / `阅读/发送人数` * 100, digits = 3), "%")
+      ),
+      累计转化率 = if_else(
+        is.na(`阅读/发送人数`), "",
+        paste0(round(累计售票数 / `阅读/发送人数` * 100, digits = 3), "%")
+      )
+    ) |>
+    mutate(`阅读/发送人数` = coalesce(as.character(`阅读/发送人数`), "")) |>
+    relocate(花费, .before = 累计ROI) |>
+    relocate(订单转化率, 售票转化率, 累计转化率, 动作日期, .before = 花费) |>
+    relocate(-动作类型) |>
+    rename(来源细分 = 自营动作) |>
+    # Toggle: include/exclude spend & ROI columns
+    dplyr::select(-花费, -累计ROI) |>
+    # Toggle: include/exclude action type column
+    arrange(动作类型, desc(动作日期)) |>
+    dplyr::select(-动作类型, -总转化率, -累计售票数, -累计收入) |>
+    knitr::kable()
+} else {
+  print("自营无销售！")  # No direct sales today
+}
+```
+
+---
+
+## Distributor Breakdown
+
+```{r distributor-breakdown}
+da_all_ntn |>
+  filter(
+    下单时间 >= date_today, 下单时间 < date_tomorrow,
+    !is.element(渠道类型, c("自营", "大麦", "剧场", "票务网站", "大客户"))
+  ) |>
+  group_by(动作日期, 渠道明细) |>
+  summarise(售票数 = sum(张数), 收入 = sum(实收), .groups = "drop") |>
+  arrange(desc(动作日期), desc(收入)) |>
+  dplyr::select(-动作日期) |>
+  knitr::kable()
+```
+
+---
+
+## Online Ticketing Platforms
+
+```{r ticketing-platforms}
+da_all_ntn |>
+  filter(
+    下单时间 >= date_today, 下单时间 < date_tomorrow,
+    渠道类型 == "票务网站"
+  ) |>
+  group_by(动作日期, 渠道明细, 项目) |>
+  summarise(售票数 = sum(张数), 收入 = sum(实收), .groups = "drop") |>
+  arrange(desc(动作日期), desc(收入)) |>
+  dplyr::select(-动作日期) |>
+  relocate(-项目) |>
+  knitr::kable()
+```
+
+---
+
+## Bulk / Corporate Orders
+
+```{r bulk-orders}
+# Placeholder — to be filled when bulk order data is available
+```
+
+---
+
+## Session-Level Daily Incremental
+
+```{r session-daily}
+da_all_ntn |>
+  filter(下单时间 >= date_today, 下单时间 < date_tomorrow) |>
+  mutate(
+    # Merge distributor sub-types
+    渠道类型 = if_else(is.element(渠道类型, c("分销-系统", "分销-报单")), "分销", 渠道类型),
+    # Merge bulk orders into self-operated for session reporting
+    渠道类型 = if_else(渠道类型 == "大客户", "自营", 渠道类型)
+  ) |>
+  group_by(场次, 项目, 渠道类型) |>
+  summarise(售票数 = sum(张数), 收入 = sum(实收), .groups = "drop") |>
+  mutate(星期 = str_replace(weekdays(as.Date(场次)), "星期", "周")) |>
+  relocate(星期, .after = 项目) |>
+  filter(售票数 != 0) |>
+  mutate(售票数 = as.character(售票数), 收入 = as.character(收入)) |>
+  pivot_wider(
+    names_from  = 渠道类型,
+    values_from = c(售票数, 收入),
+    values_fill = ""
+  ) |>
+  arrange(场次) |>
+  knitr::kable()
+```
+
+---
+
+## Inventory Update
+
+### Self-operated seat inventory (选座系统)
+
+```{r inventory-self}
+da_ntn_zy <- read_csv(
+  "D:/实习工作-交接/NTN/选座票房统计.csv",
+  show_col_types = FALSE
+)
+
+da_ntn_zy |>
+  filter(演出名称 %in% c(
+    "【深圳站】七幕人生出品 百老汇摇滚音乐剧《近乎正常》中文版",
+    "【广州站】七幕人生出品 百老汇摇滚音乐剧《近乎正常》中文版",
+    "【北京站】七幕人生出品 百老汇摇滚音乐剧《近乎正常》中文版",
+    "【上海站】七幕人生出品 百老汇摇滚音乐剧《近乎正常》中文版"
+  )) |>
+  dplyr::select(c(2, 8, 15, 17, 19)) |>
+  mutate(场次时间 = as.character(场次时间)) |>
+  arrange(场次时间, desc(票档)) |>
+  rename(自营可售 = 剩余数, 自营锁票 = 预留数, 自营已售 = 售出数) |>
+  relocate(自营可售, .before = 自营锁票) |>
+  # Fix a one-off timestamp typo in the source data
+  mutate(场次时间 = if_else(场次时间 == "2024-03-29 20:00:14", "2024-03-29 20:00:00", 场次时间)) -> da_zy_kc
+
+# Uncomment to export:
+# openxlsx::write.xlsx(da_zy_kc, "D:/实习工作-交接/NTN/库存tmp/zy.xlsx", rowNames = FALSE)
+```
+
+### Maoyan channel inventory
+
+```{r inventory-maoyan-helper}
+# Helper: extract session datetime from sheet-name strings like "2024-03-22 周五 20-00"
+mark_changci_my <- function(text) {
+  pat <- regex("(\\d{4}-\\d{2}-\\d{2})[:print:]*?(\\d{2})-(\\d{2})")
+  paste0(
+    str_match(text, pat)[, 2], " ",
+    str_match(text, pat)[, 3], ":",
+    str_match(text, pat)[, 4], ":00"
+  )
+}
+```
+
+```{r inventory-maoyan-shanghai}
+# Shanghai
+path    <- list.files("D:/实习工作-交接/NTN/上海猫眼库存", full.names = TRUE)
+da_bind <- NULL
+
+for (i in seq_along(excel_sheets(path))) {
+  da_tmp  <- readxl::read_xls(path, col_names = TRUE, sheet = excel_sheets(path)[i], skip = 1)
+  da_tmp1 <- da_tmp[1:4, c(1, 3, 17)]
+  colnames(da_tmp1) <- c("票档", "渠道已售", "渠道可售")
+
+  da_tmp1 |>
+    mutate(
+      票档     = as.numeric(str_match(票档, regex("(\\d*)"))[, 2]),
+      场次时间 = rep(excel_sheets(path)[i], 4)
+    ) |>
+    relocate(场次时间, .before = 票档) -> da_tmp1
+
+  da_bind <- bind_rows(da_bind, da_tmp1)
+}
+
+da_tmp_sh <- da_bind |>
+  mutate(场次时间 = mark_changci_my(场次时间)) |>
+  arrange(场次时间)
+```
+
+```{r inventory-maoyan-beijing-shenzhen}
+# Beijing
+path    <- list.files("D:/实习工作-交接/NTN/北京猫眼库存", full.names = TRUE)
+da_bind <- NULL
+
+for (i in seq_along(excel_sheets(path))) {
+  da_tmp  <- readxl::read_xls(path, col_names = TRUE, sheet = excel_sheets(path)[i], skip = 1)
+  da_tmp2 <- da_tmp[1:4, c(1, 3, 17)]
+  colnames(da_tmp2) <- c("票档", "渠道已售", "渠道可售")
+  da_tmp2 |>
+    mutate(
+      票档     = as.numeric(str_match(票档, regex("(\\d*)"))[, 2]),
+      场次时间 = rep(excel_sheets(path)[i], 4)
+    ) |>
+    relocate(场次时间, .before = 票档) -> da_tmp2
+  da_bind <- bind_rows(da_bind, da_tmp2)
+}
+da_tmp_bj <- da_bind |>
+  mutate(场次时间 = mark_changci_my(场次时间))
+
+# Shenzhen
+path    <- list.files("D:/实习工作-交接/NTN/深圳猫眼库存", full.names = TRUE)
+da_bind <- NULL
+
+for (i in seq_along(excel_sheets(path))) {
+  da_tmp  <- readxl::read_xls(path, col_names = TRUE, sheet = excel_sheets(path)[i], skip = 1)
+  da_tmp3 <- da_tmp[1:4, c(1, 3, 17)]
+  colnames(da_tmp3) <- c("票档", "渠道已售", "渠道可售")
+  da_tmp3 |>
+    mutate(
+      票档     = as.numeric(str_match(票档, regex("(\\d*)"))[, 2]),
+      场次时间 = rep(excel_sheets(path)[i], 4)
+    ) |>
+    relocate(场次时间, .before = 票档) -> da_tmp3
+  da_bind <- bind_rows(da_bind, da_tmp3)
+}
+da_tmp_sz <- da_bind |>
+  mutate(场次时间 = mark_changci_my(场次时间))
+
+# Merge all three cities; fix a known timestamp format anomaly
+da_my_kucun <- da_tmp_sh |>
+  bind_rows(da_tmp_bj) |>
+  bind_rows(da_tmp_sz) |>
+  mutate(场次时间 = if_else(
+    场次时间 == "2024-03-22 周五 20-00", "2024-03-22 20:00:00", 场次时间
+  )) |>
+  relocate(渠道可售, .before = 渠道已售) |>
+  arrange(场次时间)
+
+# Uncomment to export:
+# openxlsx::write.xlsx(da_my_kucun, "D:/my.xlsx", rowNames = FALSE)
+```
+
+### Venue-side inventory
+
+```{r inventory-venues}
+# --- Shanghai Conservatory ---
+da_sy <- read_csv("D:/实习工作-交接/NTN/上音库存.csv", skip = 1, show_col_types = FALSE)
+da_sy <- da_sy[1:5, ]
+
+da_sy |>
+  dplyr::select(c(2, 5)) |>
+  `colnames<-`(c("场次", "张数")) |>
+  mutate(票价 = 680, 张数 = as.numeric(张数)) -> da_sy1
+
+da_sy |>
+  dplyr::select(c(2, 7)) |>
+  `colnames<-`(c("场次", "张数")) |>
+  mutate(票价 = 880, 张数 = as.numeric(张数)) -> da_sy2
+
+da_sy2 |>
+  bind_rows(da_sy1) |>
+  mutate(场次 = as.POSIXct(场次, format = "%Y年%m月%d日 %H:%M:%S", tz = "UTC")) |>
+  rename(票档 = 票价, 剧院已售 = 张数, 场次时间 = 场次) |>
+  mutate(场次时间 = as.character(场次时间)) |>
+  arrange(场次时间) -> da_sy_kc
+
+# Uncomment to export:
+# openxlsx::write.xlsx(da_sy_kc, "D:/实习工作-交接/NTN/库存tmp/sy.xlsx", rowNames = FALSE)
+```
+
+```{r inventory-guangzhou}
+# --- Guangdong Arts Theatre ---
+pat      <- regex("^场次时间：([:print:]*)")
+da_gy_kc <- readxl::read_xlsx("D:/实习工作-交接/NTN/广艺库存.xlsx", col_names = FALSE)
+
+da_gy_kc |>
+  dplyr::select(c(1, 6, 15)) |>
+  `colnames<-`(c("票价", "售票数", "剧院剩余")) |>
+  mutate(场次时间 = str_match(票价, pat)[, 2]) |>
+  filter(
+    is.element(票价, c("280元(280.00)", "480元(480.00)", "680元(680.00)", "880元(880.00)")) |
+      !is.na(场次时间)
+  ) |>
+  fill(场次时间) |>
+  filter(!is.na(售票数)) |>
+  mutate(
+    剧院已售 = as.numeric(售票数),
+    票价      = as.numeric(str_match(票价, regex("[0-9]*[(]([:print:]*)[)]"))[, 2])
+  ) |>
+  rename(票档 = 票价) |>
+  arrange(场次时间, desc(票档)) |>
+  dplyr::select(-售票数) |>
+  relocate(场次时间, .before = 票档) -> da_gy_kc
+
+# Uncomment to export:
+# openxlsx::write.xlsx(da_gy_kc, "D:/实习工作-交接/NTN/库存tmp/gy.xlsx", rowNames = FALSE)
+```
+
+```{r inventory-shenzhen-poly}
+# --- Shenzhen Poly Theatre ---
+pat      <- regex("([:print:]{2})[:print:]([:print:]*)")
+da_bl_kc <- readxl::read_xlsx("D:/实习工作-交接/NTN/深圳保利库存.xlsx", col_names = TRUE)
+
+da_bl_kc |>
+  dplyr::select(
+    "演出时间",
+    "A级_票价", "A级_已售数量", "A级_已售金额",
+    "B级_票价", "B级_已售数量", "B级_已售金额",
+    "C级_票价", "C级_已售数量", "C级_已售金额",
+    "D级_票价", "D级_已售数量", "D级_已售金额"
+  ) |>
+  pivot_longer(
+    cols      = c("A级_票价", "A级_已售数量", "A级_已售金额",
+                  "B级_票价", "B级_已售数量", "B级_已售金额",
+                  "C级_票价", "C级_已售数量", "C级_已售金额",
+                  "D级_票价", "D级_已售数量", "D级_已售金额"),
+    names_to  = "票属性",
+    values_to = "数值"
+  ) |>
+  mutate(
+    等级 = str_match(票属性, pat)[, 2],
+    属性 = str_match(票属性, pat)[, 3]
+  ) |>
+  dplyr::select(-票属性) |>
+  pivot_wider(names_from = 属性, values_from = 数值) |>
+  mutate(场次时间 = as.character(as.POSIXct(演出时间, tz = "UTC"))) |>
+  rename(票档 = 票价, 数量 = 已售数量) |>
+  dplyr::select(场次时间, 票档, 数量) |>
+  rename(剧院已售 = 数量) |>
+  arrange(场次时间) -> da_bl_kc
+
+# Uncomment to export:
+# openxlsx::write.xlsx(da_bl_kc, "D:/实习工作-交接/NTN/库存tmp/bl.xlsx", rowNames = FALSE)
+```
+
+### Inventory summary — by price tier
+
+```{r inventory-summary}
+# Total seats per tier per session (hard-coded from contract/venue specs)
+# Vectors are ordered to align with the rows of da_zy_kc after the join
+a <- c(rep(c(278, 319, 392, 457), 3),   # first 3 sessions
+       rep(c(502, 282, 200, 158), 3),    # next  3 sessions
+       rep(c(294, 404, 144, 310), 4),    # next  4 sessions
+       rep(c(274, 334, 261, 229), 5))    # last  5 sessions
+
+da_zy_kc |>
+  left_join(da_sy_kc,   by = c("场次时间", "票档")) |>
+  left_join(da_my_kucun, by = c("场次时间", "票档")) |>
+  bind_rows(da_gy_kc) |>
+  bind_rows(da_bl_kc) |>
+  mutate(
+    渠道可售 = as.numeric(渠道可售),
+    剧院剩余 = as.numeric(剧院剩余),
+    渠道已售 = as.numeric(渠道已售)
+  ) -> da_ntn_kc
+
+da_ntn_kc[is.na(da_ntn_kc)] <- 0
+
+da_ntn_kc |>
+  group_by(场次时间, 票档) |>
+  summarise(
+    自营可售 = sum(as.numeric(自营可售)),
+    自营锁票 = sum(as.numeric(自营锁票)),
+    自营已售 = sum(as.numeric(自营已售)),
+    剧院在售 = sum(as.numeric(剧院剩余)),
+    剧院已售 = sum(as.numeric(剧院已售)),
+    渠道在售 = sum(as.numeric(渠道可售)),
+    渠道已售 = sum(as.numeric(渠道已售)),
+    .groups  = "drop"
+  ) |>
+  arrange(场次时间, desc(票档)) |>
+  # Remove a cancelled / placeholder session
+  filter(场次时间 != "2024-02-24 15:00:00") -> da_ntn_kc
+
+# Attach total-capacity column and recalculate venue-held remainder
+da_ntn_kc <- data.frame(da_ntn_kc, a) |>
+  mutate(剧院在售 = a - 自营可售 - 自营锁票 - 自营已售 - 剧院已售 - 渠道在售 - 渠道已售)
+
+openxlsx::write.xlsx(
+  da_ntn_kc,
+  "D:/实习工作-交接/NTN/库存(分票档).xlsx",
+  rowNames = FALSE, colNames = TRUE
+)
+
+# Aggregate to session level (collapse price tiers)
+da_ntn_kc |>
+  dplyr::select(-票档) |>
+  group_by(场次时间) |>
+  summarise(
+    自营可售 = sum(自营可售),
+    自营锁票 = sum(自营锁票),
+    自营已售 = sum(自营已售),
+    剧在售余 = sum(剧院在售),
+    剧院已售 = sum(剧院已售),
+    渠道在售 = sum(渠道在售),
+    渠道已售 = sum(渠道已售)
+  ) -> da_kc1
+
+openxlsx::write.xlsx(
+  da_kc1,
+  "D:/实习工作-交接/NTN/库存(分场次).xlsx",
+  rowNames = FALSE, colNames = TRUE
+)
+```
+
+---
+
+## Helper Functions
+
+```{r helper-mark-changci-sz-bl}
+# Convert informal session strings used in Shenzhen Poly bulk-order forms
+# to standard ISO datetime strings.
+mark_changci_sz_bl <- function(text) {
+  ans <- rep("", length(text))
+
+  ans[text == "24号20:00"]         <- "2023-11-24 20:00:00"
+  ans[text == "25号14:30"]         <- "2023-11-25 15:00:00"
+  ans[text == "25号15:00"]         <- "2023-11-25 15:00:00"
+  ans[text == "25号20:00"]         <- "2023-11-25 20:00:00"
+  ans[text == "26号14:30"]         <- "2023-11-26 15:00:00"
+  ans[text == "26号15:00"]         <- "2023-11-26 15:00:00"
+  ans[text == "26号20:00（周中场）"]  <- "2023-11-26 20:00:00"
+  ans[text == "26号20:00"]         <- "2023-11-26 20:00:00"
+
+  if (any(ans == "")) {
+    print(unique(text[which(ans == "")]))
+    warning("mark_changci_sz_bl: unrecognised session label(s)")
+  }
+  ans
+}
+```
+
+---
+
+## Session Filter Reference
+
+```{r session-filter-reference}
+# Convenience vector for filtering specific upcoming sessions
+# (update dates as the tour progresses)
+sessions_upcoming <- c(
+  "2024-03-22 20:00:00", "2024-03-23 15:00:00", "2024-03-23 20:00:00",
+  "2024-03-29 20:00:00", "2024-03-30 15:00:00", "2024-03-30 20:00:00",
+  "2024-04-05 19:30:00",
+  "2024-04-06 14:30:00", "2024-04-06 19:30:00",
+  "2024-04-07 19:30:00",
+  "2024-04-19 19:30:00",
+  "2024-04-20 14:00:00", "2024-04-20 19:30:00",
+  "2024-04-21 14:00:00", "2024-04-21 19:30:00"
+)
+# Usage: filter(场次时间 %in% sessions_upcoming)
+```
